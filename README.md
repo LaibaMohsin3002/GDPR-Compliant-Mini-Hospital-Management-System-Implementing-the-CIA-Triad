@@ -1,0 +1,1 @@
+# GDPR-Compliant-Mini-Hospital-Management-System-Implementing-the-CIA-Triad

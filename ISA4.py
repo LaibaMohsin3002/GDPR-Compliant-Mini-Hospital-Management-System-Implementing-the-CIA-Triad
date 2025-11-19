@@ -15,6 +15,8 @@ import time
 import datetime
 import pandas as pd
 from cryptography.fernet import Fernet
+import altair as alt
+
 
 # -------------------------
 # Configuration / Constants
@@ -90,6 +92,22 @@ def init_db():
         k TEXT PRIMARY KEY,
         v TEXT
     )""")
+        # GDPR consent table
+    c.execute("""
+    CREATE TABLE IF NOT EXISTS consent (
+        consent_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        username TEXT,
+        consent_text TEXT,
+        accepted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+    """)
+
+    # Add data retention column if missing
+    c.execute("PRAGMA table_info(patients)")
+    cols = [col[1] for col in c.fetchall()]
+    if "retention_until" not in cols:
+        c.execute("ALTER TABLE patients ADD COLUMN retention_until TIMESTAMP")
+
     # seed users if not exist
     users = [
         ("admin", "admin123", "admin"),
@@ -182,7 +200,40 @@ def authenticate(username, password):
 # -------------------------
 # UI Components
 # -------------------------
+# def login_ui():
+#     st.title("Hospital Management — Login")
+#     username = st.text_input("Username")
+#     password = st.text_input("Password", type="password")
+#     if st.button("Login"):
+#         user = authenticate(username.strip(), password.strip())
+#         if user:
+#             st.success(f"Welcome {user['username']} ({user['role']})")
+#             # set session state
+#             st.session_state['user'] = user
+#             log_action(user['user_id'], user['username'], user['role'], "login", "successful login")
+#             st.experimental_rerun()
+#         else:
+#             st.warning("Invalid credentials")
+#             # log failed attempt with role unknown
+#             log_action(None, username, "unknown", "login_failed", "invalid credentials")
+
 def login_ui():
+    # GDPR consent banner
+    consent_text = """By using this system you consent to the storage and processing of personal data under GDPR guidelines."""
+
+    st.info(consent_text)
+
+    if "consent_given" not in st.session_state:
+        if st.button("Accept & Continue"):
+            st.session_state["consent_given"] = True
+            conn = get_conn()
+            conn.execute("INSERT INTO consent (username, consent_text) VALUES (?, ?)", 
+                         ("anonymous", consent_text))
+            conn.commit()
+            conn.close()
+            st.experimental_rerun()
+        return
+
     st.title("Hospital Management — Login")
     username = st.text_input("Username")
     password = st.text_input("Password", type="password")
@@ -190,14 +241,13 @@ def login_ui():
         user = authenticate(username.strip(), password.strip())
         if user:
             st.success(f"Welcome {user['username']} ({user['role']})")
-            # set session state
             st.session_state['user'] = user
-            log_action(user['user_id'], user['username'], user['role'], "login", "successful login")
+            log_action(user['user_id'], user['username'], user['role'], "login", "successful")
             st.experimental_rerun()
         else:
             st.warning("Invalid credentials")
-            # log failed attempt with role unknown
             log_action(None, username, "unknown", "login_failed", "invalid credentials")
+
 
 def show_footer():
     try:
@@ -215,6 +265,27 @@ def show_footer():
     st.sidebar.write(f"**Uptime:** {uptime}")
     st.sidebar.write(f"**Last sync (UTC):** {last_sync}")
 
+def activity_graph():
+    conn = get_conn()
+    df = pd.read_sql_query("""
+        SELECT DATE(timestamp) as day, COUNT(*) as actions
+        FROM logs
+        GROUP BY DATE(timestamp)
+        ORDER BY day
+    """, conn)
+    conn.close()
+
+    if df.empty:
+        st.info("No activity yet.")
+        return
+
+    chart = alt.Chart(df).mark_line(point=True).encode(
+        x="day:T",
+        y="actions:Q"
+    ).properties(title="User Activity Per Day")
+
+    st.altair_chart(chart, use_container_width=True)
+
 # -------------------------
 # Admin Controls
 # -------------------------
@@ -230,7 +301,22 @@ def admin_view(user):
         export_patients_csv()
     st.markdown("### Integrity Audit Log")
     show_logs_table()
-
+    st.markdown("### GDPR — Data Retention")
+    try:
+        conn = get_conn()
+        df = pd.read_sql_query("""
+            SELECT patient_id, anonymized_name, retention_until 
+            FROM patients 
+            WHERE retention_until IS NOT NULL 
+            ORDER BY retention_until ASC
+            """, conn)
+        conn.close()
+        st.dataframe(df)
+    except:
+        st.warning("No retention data.")
+    st.markdown("### Real-Time Activity Graph")
+    activity_graph()
+    
 # -------------------------
 # Doctor Controls
 # -------------------------
@@ -299,7 +385,10 @@ def show_add_patient_form(user):
             try:
                 conn = get_conn()
                 c = conn.cursor()
-                c.execute("INSERT INTO patients (name, contact, diagnosis) VALUES (?, ?, ?)", (name, contact, diagnosis))
+                # c.execute("INSERT INTO patients (name, contact, diagnosis) VALUES (?, ?, ?)", (name, contact, diagnosis))
+                retention_days = 30  # default policy
+                retention_until = datetime.datetime.utcnow() + datetime.timedelta(days=retention_days)
+                c.execute("""INSERT INTO patients (name, contact, diagnosis, retention_until) VALUES (?, ?, ?, ?)""", (name, contact, diagnosis, retention_until))
                 conn.commit()
                 pid = c.lastrowid
                 # Create anonymized values immediately
@@ -312,7 +401,7 @@ def show_add_patient_form(user):
                 log_action(user['user_id'], user['username'], user['role'], "add_patient", f"patient_id={pid}")
             except Exception as e:
                 st.error("Add failed: " + str(e))
-
+    
 def edit_patient_form(pid, user):
     try:
         conn = get_conn()
@@ -409,15 +498,31 @@ def export_patients_csv():
     except Exception as e:
         st.error("Export failed: " + str(e))
 
+def enforce_data_retention():
+    try:
+        conn = get_conn()
+        c = conn.cursor()
+        c.execute("DELETE FROM patients WHERE retention_until IS NOT NULL AND retention_until < CURRENT_TIMESTAMP")
+        deleted = conn.total_changes
+        conn.commit()
+        conn.close()
+        if deleted > 0:
+            st.warning(f"GDPR: {deleted} expired records auto-deleted.")
+    except Exception as e:
+        st.error("Retention enforcement failed: " + str(e))
+
 # -------------------------
 # Main App Flow
 # -------------------------
 def main():
     st.set_page_config(page_title="Mini Hospital — GDPR demo", layout="wide")
+    
     show_footer()
     if 'user' not in st.session_state:
         login_ui()
         return
+    
+    enforce_data_retention()
 
     user = st.session_state['user']
     # Topbar info and logout

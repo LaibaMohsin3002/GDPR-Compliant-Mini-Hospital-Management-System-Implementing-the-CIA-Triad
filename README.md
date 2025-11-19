@@ -6,5 +6,7 @@ keeping audit trails of who accesses what data and why. The Hospital administrat
 dashboard that ensures: 
 
 • Confidentiality: Patient identities and medical data are hidden or encrypted. 
+
 • Integrity: Only authorized roles can modify or audit data; any change must be logged. 
+
 • Availability: The system remains functional and data retrievable to authorized users. 
